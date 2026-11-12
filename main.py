@@ -7,21 +7,25 @@ top 10 across the scored window, plus a top-10 list.
 Model, per game:
   - rank velocity from recent reads (places/hour, recency weighted),
   - playing-count growth slope (log scale) folded into the velocity,
-  - damped drift + mild mean reversion for the expected rank at each future
+  - a staleness fall: a game missing from the recent chart keeps sliding,
+  - damped drift + mean reversion for the expected rank at each future
     hour, a Gaussian place kernel whose width grows with the horizon,
-  - a hard age-out: games leave the chart 28 days after creation, so their
-    probability is zero for the hours after they age out,
   - the per-hour distributions are averaged over the window and each place
     is renormalized to a cap below 1, leaving an unnamed share for games
     nobody can name yet (new releases entering mid-window).
+
+The chart's 28-day age-out is implemented (age_mode) but disabled: backtests
+on the practice history showed the 28 days run from a game's public release,
+not its universe creation date, so zeroing probability on creation dates
+loses points. All constants were fitted on practice backtest folds against
+the house persistence baseline and kept few on purpose.
 Deterministic: no randomness, no clock reads beyond the input data.
 """
 
 import json
 import math
 import os
-import sys
-from datetime import datetime, timezone
+from datetime import datetime
 
 # Tunable parameters (fitted on practice backtests, kept few on purpose).
 P = {
@@ -37,6 +41,7 @@ P = {
     "tail_mu": 26.0,      # games with expected rank beyond this get no rows
     "age_mode": "off",    # 'off' | 'soft' | 'hard': 28-day chart age-out
     "age_soft": 0.3,      # probability scale after ageing out in 'soft' mode
+    "stale_k": 1.0,       # extra fall rate (places/hour) for off-chart games
 }
 
 
@@ -122,9 +127,12 @@ def forecast(reads, history_until_ts, hours=72, created_override=None, params=No
         exit_h = None
         if uid in created:
             exit_h = (created[uid] + 28 * 86400 - t0) / 3600.0 - T
+        stale_h = T - t_last
         feats[uid] = {
-            "r_last": r_last, "r_mean": r_mean, "stale_h": T - t_last,
-            "v": v_rank - slope * p["slope_k"], "vol": vol, "exit_h": exit_h,
+            "r_last": r_last, "r_mean": r_mean, "stale_h": stale_h,
+            "v": v_rank - slope * p["slope_k"]
+                 + p["stale_k"] * min(stale_h, 24.0) / 24.0,
+            "vol": vol, "exit_h": exit_h,
         }
 
     # Only games seen on the chart recently can be forecast to hold places.
@@ -163,6 +171,10 @@ def forecast(reads, history_until_ts, hours=72, created_override=None, params=No
     for k in range(1, places + 1):
         cap = p["cap1"] + (p["cap10"] - p["cap1"]) * (k - 1) / (places - 1)
         col = [(u, acc[u][k - 1] / hours) for u in cands]
+        # The format allows at most 100 rows per place; on the denser final
+        # history the candidate set is larger, so keep only the strongest.
+        col.sort(key=lambda x: -x[1])
+        col = col[:100]
         s = sum(v for _, v in col)
         if s <= 0:
             continue
